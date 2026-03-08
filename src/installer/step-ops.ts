@@ -524,6 +524,10 @@ export function claimStep(agentId: string): ClaimResult {
   // Always inject run_id so templates can use {{run_id}} (e.g. for scoped progress files)
   context["run_id"] = step.run_id;
 
+  // Ensure feedback keys are always defined (even as empty) to avoid missing-key failures
+  if (!context["verify_feedback"]) context["verify_feedback"] = "";
+  if (!context["reject_feedback"]) context["reject_feedback"] = "";
+
   // Compute has_frontend_changes from git diff when repo and branch are available
   if (context["repo"] && context["branch"]) {
     context["has_frontend_changes"] = computeHasFrontendChanges(context["repo"], context["branch"]);
@@ -622,10 +626,6 @@ export function claimStep(agentId: string): ClaimResult {
       context["stories_remaining"] = String(pendingCount);
       context["progress"] = readProgressFile(step.run_id);
 
-      if (!context["verify_feedback"]) {
-        context["verify_feedback"] = "";
-      }
-
       const missingKeys = findMissingTemplateKeys(step.input_template, context);
       if (missingKeys.length > 0) {
         failStepWithMissingInputs(step.id, step.step_id, step.run_id, missingKeys);
@@ -676,12 +676,12 @@ export function claimStep(agentId: string): ClaimResult {
 /**
  * Complete a step: save output, merge context, advance pipeline.
  */
-export function completeStep(stepId: string, output: string): { advanced: boolean; runCompleted: boolean } {
+export async function completeStep(stepId: string, output: string): Promise<{ advanced: boolean; runCompleted: boolean }> {
   const db = getDb();
 
   const step = db.prepare(
-    "SELECT id, run_id, step_id, step_index, type, loop_config, current_story_id FROM steps WHERE id = ?"
-  ).get(stepId) as { id: string; run_id: string; step_id: string; step_index: number; type: string; loop_config: string | null; current_story_id: string | null } | undefined;
+    "SELECT id, run_id, step_id, step_index, type, loop_config, current_story_id, reject_to FROM steps WHERE id = ?"
+  ).get(stepId) as { id: string; run_id: string; step_id: string; step_index: number; type: string; loop_config: string | null; current_story_id: string | null; reject_to: string | null } | undefined;
 
   if (!step) throw new Error(`Step not found: ${stepId}`);
 
@@ -760,6 +760,24 @@ export function completeStep(stepId: string, output: string): { advanced: boolea
     const lc: LoopConfig = JSON.parse(loopStepRow.loop_config);
     if (lc.verifyEach && lc.verifyStep === step.step_id) {
       return handleVerifyEachCompletion(step, loopStepRow.id, output, context);
+    }
+  }
+
+  // Check if a non-loop single step is signalling a rollback via STATUS: retry or STATUS: reject
+  // This handles cases like tester/reviewer sending the pipeline back to an earlier step.
+  if (step.type !== "loop" && step.reject_to) {
+    const status = context["status"]?.toLowerCase();
+    if (status === "retry" || status === "reject") {
+      const feedback = context["issues"] ?? context["failures"] ?? context["feedback"] ?? output;
+      return rollbackPipeline({
+        currentStepDbId: stepId,
+        currentStepPublicId: step.step_id,
+        currentStepIndex: step.step_index,
+        runId: step.run_id,
+        targetStepPublicId: step.reject_to,
+        feedback,
+        context,
+      });
     }
   }
 
@@ -904,6 +922,127 @@ function checkLoopContinuation(runId: string, loopStepId: string): { advanced: b
   }
 
   return advancePipeline(runId);
+}
+
+/**
+ * Roll back the pipeline to a specific earlier step.
+ *
+ * Called when a non-loop step outputs STATUS: retry or STATUS: reject and
+ * has `reject_to` (from on_fail.retry_step) configured in its workflow definition.
+ *
+ * - Increments retry_count on the current step; if exhausted, fails run.
+ * - Stores reject feedback in the run context as `reject_feedback`.
+ * - Resets the target step to "pending" and all steps between (exclusive)
+ *   and the current step (inclusive) back to "waiting".
+ * - If the target step is a loop step, also resets all non-failed stories to
+ *   "pending" so the loop re-executes with the new feedback.
+ */
+async function rollbackPipeline(params: {
+  currentStepDbId: string;
+  currentStepPublicId: string;
+  currentStepIndex: number;
+  runId: string;
+  targetStepPublicId: string;
+  feedback: string;
+  context: Record<string, string>;
+}): Promise<{ advanced: boolean; runCompleted: boolean }> {
+  const db = getDb();
+  const wfId = getWorkflowId(params.runId);
+
+  const stepRow = db.prepare(
+    "SELECT retry_count, max_retries FROM steps WHERE id = ?"
+  ).get(params.currentStepDbId) as { retry_count: number; max_retries: number } | undefined;
+
+  if (!stepRow) return { advanced: false, runCompleted: false };
+
+  const newRetry = stepRow.retry_count + 1;
+
+  if (newRetry > stepRow.max_retries) {
+    // Retries exhausted — fail the step and the run
+    db.prepare(
+      "UPDATE steps SET status = 'failed', output = ?, retry_count = ?, updated_at = datetime('now') WHERE id = ?"
+    ).run(params.feedback, newRetry, params.currentStepDbId);
+    db.prepare(
+      "UPDATE runs SET status = 'failed', updated_at = datetime('now') WHERE id = ?"
+    ).run(params.runId);
+    emitEvent({ ts: new Date().toISOString(), event: "step.failed", runId: params.runId, workflowId: wfId, stepId: params.currentStepPublicId, detail: `Rollback retries exhausted: ${params.feedback}` });
+    emitEvent({ ts: new Date().toISOString(), event: "run.failed", runId: params.runId, workflowId: wfId, detail: "Rollback retries exhausted" });
+    scheduleRunCronTeardown(params.runId);
+    await notifyFailureExhausted(params.runId, params.currentStepPublicId, params.feedback);
+    return { advanced: false, runCompleted: false };
+  }
+
+  // Find the target step
+  const targetStep = db.prepare(
+    "SELECT id, step_index, type FROM steps WHERE run_id = ? AND step_id = ? LIMIT 1"
+  ).get(params.runId, params.targetStepPublicId) as { id: string; step_index: number; type: string } | undefined;
+
+  if (!targetStep) {
+    // Target step not found — treat as exhausted retries to avoid infinite loop
+    db.prepare(
+      "UPDATE steps SET status = 'failed', output = ?, retry_count = ?, updated_at = datetime('now') WHERE id = ?"
+    ).run(`Rollback target step "${params.targetStepPublicId}" not found`, newRetry, params.currentStepDbId);
+    db.prepare(
+      "UPDATE runs SET status = 'failed', updated_at = datetime('now') WHERE id = ?"
+    ).run(params.runId);
+    const detail = `Rollback target step "${params.targetStepPublicId}" not found`;
+    emitEvent({ ts: new Date().toISOString(), event: "step.failed", runId: params.runId, workflowId: wfId, stepId: params.currentStepPublicId, detail });
+    emitEvent({ ts: new Date().toISOString(), event: "run.failed", runId: params.runId, workflowId: wfId, detail });
+    scheduleRunCronTeardown(params.runId);
+    return { advanced: false, runCompleted: false };
+  }
+
+  // Store reject feedback in context
+  params.context["reject_feedback"] = params.feedback;
+  db.prepare(
+    "UPDATE runs SET context = ?, updated_at = datetime('now') WHERE id = ?"
+  ).run(JSON.stringify(params.context), params.runId);
+
+  // Set current step back to "waiting" (will be re-triggered once target completes again)
+  db.prepare(
+    "UPDATE steps SET status = 'waiting', retry_count = ?, updated_at = datetime('now') WHERE id = ?"
+  ).run(newRetry, params.currentStepDbId);
+
+  // Reset all steps strictly between target (exclusive) and current (exclusive) to "waiting"
+  if (params.currentStepIndex > targetStep.step_index + 1) {
+    db.prepare(
+      "UPDATE steps SET status = 'waiting', updated_at = datetime('now') WHERE run_id = ? AND step_index > ? AND step_index < ?"
+    ).run(params.runId, targetStep.step_index, params.currentStepIndex);
+  }
+
+  // If target is a loop step, reset all non-failed stories to "pending" and clear current_story_id
+  if (targetStep.type === "loop") {
+    db.prepare(
+      "UPDATE stories SET status = 'pending', retry_count = 0, updated_at = datetime('now') WHERE run_id = ? AND status != 'failed'"
+    ).run(params.runId);
+    db.prepare(
+      "UPDATE steps SET current_story_id = NULL, updated_at = datetime('now') WHERE id = ?"
+    ).run(targetStep.id);
+
+    // Also reset the loop's verify step (if any) back to "waiting"
+    const loopStepRow = db.prepare(
+      "SELECT loop_config FROM steps WHERE id = ?"
+    ).get(targetStep.id) as { loop_config: string | null } | undefined;
+    if (loopStepRow?.loop_config) {
+      const lc: LoopConfig = JSON.parse(loopStepRow.loop_config);
+      if (lc.verifyEach && lc.verifyStep) {
+        db.prepare(
+          "UPDATE steps SET status = 'waiting', updated_at = datetime('now') WHERE run_id = ? AND step_id = ?"
+        ).run(params.runId, lc.verifyStep);
+      }
+    }
+  }
+
+  // Set target step to "pending"
+  db.prepare(
+    "UPDATE steps SET status = 'pending', updated_at = datetime('now') WHERE id = ?"
+  ).run(targetStep.id);
+
+  emitEvent({ ts: new Date().toISOString(), event: "step.rejected", runId: params.runId, workflowId: wfId, stepId: params.currentStepPublicId, detail: params.feedback });
+  emitEvent({ ts: new Date().toISOString(), event: "pipeline.rejected", runId: params.runId, workflowId: wfId, stepId: params.targetStepPublicId, detail: `Rolled back from ${params.currentStepPublicId}` });
+  logger.info(`Pipeline rolled back from "${params.currentStepPublicId}" to "${params.targetStepPublicId}"`, { runId: params.runId });
+
+  return { advanced: true, runCompleted: false };
 }
 
 /**

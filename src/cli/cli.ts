@@ -60,12 +60,14 @@ function formatEventLabel(evt: AntfarmEvent): string {
     "step.done": "Step completed",
     "step.failed": "Step failed",
     "step.timeout": "Step timed out",
+    "step.rejected": "Step rejected (rollback)",
     "story.started": "Story started",
     "story.done": "Story done",
     "story.verified": "Story verified",
     "story.retry": "Story retry",
     "story.failed": "Story failed",
     "pipeline.advanced": "Pipeline advanced",
+    "pipeline.rejected": "Pipeline rolled back",
   };
   return labels[evt.event] ?? evt.event;
 }
@@ -391,7 +393,7 @@ async function main() {
         }
         output = Buffer.concat(chunks).toString("utf-8").trim();
       }
-      const result = completeStep(target, output);
+      const result = await completeStep(target, output);
       process.stdout.write(JSON.stringify(result) + "\n");
       return;
     }

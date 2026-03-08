@@ -9,9 +9,9 @@ const MAX_EVENTS_SIZE = 10 * 1024 * 1024; // 10MB
 
 export type EventType =
   | "run.started" | "run.completed" | "run.failed"
-  | "step.pending" | "step.running" | "step.done" | "step.failed" | "step.timeout"
+  | "step.pending" | "step.running" | "step.done" | "step.failed" | "step.timeout" | "step.rejected"
   | "story.started" | "story.done" | "story.verified" | "story.retry" | "story.failed"
-  | "pipeline.advanced";
+  | "pipeline.advanced" | "pipeline.rejected";
 
 export interface AntfarmEvent {
   ts: string;

@@ -183,6 +183,9 @@ steps:
       VERIFY FEEDBACK (if retrying):
       {{verify_feedback}}
 
+      REJECT FEEDBACK (if rolled back from verify):
+      {{reject_feedback}}
+
       Instructions:
       1. cd into the repo, checkout the branch
       2. Implement the fix based on the root cause and fix approach
