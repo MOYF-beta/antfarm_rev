@@ -175,6 +175,9 @@ steps:
       VERIFY FEEDBACK (if retrying):
       {{verify_feedback}}
 
+      REJECT FEEDBACK (if rolled back from test/review):
+      {{reject_feedback}}
+
       PROGRESS LOG:
       {{progress}}
 
